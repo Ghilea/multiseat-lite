@@ -1,0 +1,5 @@
+This DVL was generated for MultiSeat Lite development validation only.
+
+It was produced with the general-use Microsoft Windows-driver CodeQL workflow,
+not a selected WHCP/HLK certification matrix. It must not be represented as
+Windows certification evidence.

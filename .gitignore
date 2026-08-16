@@ -1,0 +1,13 @@
+node_modules/
+dist/
+src-tauri/target/
+*.log
+.DS_Store
+Thumbs.db
+# Generated CodeQL databases
+native/keyboard-filter/artifacts/codeql/database-*/
+# Generated CodeQL databases
+native/keyboard-filter/artifacts/**/codeql/database*/
+
+# Rust build output
+**/target/

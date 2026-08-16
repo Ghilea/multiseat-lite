@@ -1,0 +1,60 @@
+; VALIDATION ONLY -- never install this package.
+; The deliberately nonexistent hardware ID cannot match a production keyboard.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Keyboard
+ClassGuid={4D36E96B-E325-11CE-BFC1-08002BE10318}
+Provider=%Provider%
+CatalogFile=MultiSeatKeyboardFilter.cat
+DriverVer=08/15/2026,0.1.0.0
+PnpLockdown=1
+
+[Manufacturer]
+%Provider%=Models,NTamd64.10.0...19041
+
+[Models.NTamd64.10.0...19041]
+%DeviceDescription%=MsklInstall,HID\MSKL_VALIDATION_ONLY_00000000
+
+[MsklInstall.NT]
+CopyFiles=MsklCopyFiles
+
+[MsklInstall.NT.Filters]
+AddFilter=MultiSeatKeyboardFilter,,MsklUpperFilter
+
+[MsklUpperFilter]
+FilterPosition=Upper
+
+[MsklInstall.NT.Services]
+AddService=MultiSeatKeyboardFilter,0x00000002,MsklService
+
+[MsklInstall.NT.Wdf]
+KmdfService=MultiSeatKeyboardFilter,MsklWdf
+
+[MsklWdf]
+KmdfLibraryVersion=1.31
+
+[MsklService]
+DisplayName=%ServiceDescription%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\MultiSeatKeyboardFilter.sys
+
+[MsklCopyFiles]
+MultiSeatKeyboardFilter.sys
+
+[DestinationDirs]
+DefaultDestDir=13
+
+[SourceDisksFiles]
+MultiSeatKeyboardFilter.sys=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[Strings]
+Provider="MultiSeat Lite"
+DeviceDescription="MultiSeat Lite validation-only keyboard filter"
+ServiceDescription="MultiSeat Lite keyboard filter"
+DiskName="MultiSeat Lite validation-only package"

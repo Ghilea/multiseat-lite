@@ -1,0 +1,13 @@
+[package]
+name = "multiseat-keyboard-filter-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+multiseat-keyboard-filter-policy = { path = "../service-policy" }
+multiseat-lite-lib = { package = "multiseat-lite", path = "../../../src-tauri" }
+serde_json = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

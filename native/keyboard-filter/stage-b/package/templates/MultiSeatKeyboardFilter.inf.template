@@ -1,0 +1,62 @@
+; DESIGN TEMPLATE ONLY -- deliberately not installable.
+; Replace the token with one exact keyboard TLC hardware ID only after the
+; service has resolved and the user has confirmed the physical Container ID.
+; Never change this to a Keyboard class-wide or generic HID match.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=Keyboard
+ClassGuid={4D36E96B-E325-11CE-BFC1-08002BE10318}
+Provider=%Provider%
+CatalogFile=MultiSeatKeyboardFilter.cat
+DriverVer=MM/DD/YYYY,0.1.0.0
+PnpLockdown=1
+
+[Manufacturer]
+%Provider%=Models,NTamd64.10.0...19041
+
+[Models.NTamd64.10.0...19041]
+%DeviceDescription%=MsklInstall, REPLACE_WITH_EXACT_KEYBOARD_TLC_HARDWARE_ID
+
+[MsklInstall.NT]
+CopyFiles=MsklCopyFiles
+
+[MsklInstall.NT.Filters]
+AddFilter=MultiSeatKeyboardFilter,,MsklUpperFilter
+
+[MsklUpperFilter]
+FilterPosition=Upper
+
+[MsklInstall.NT.Services]
+AddService=MultiSeatKeyboardFilter,0x00000002,MsklService
+
+[MsklInstall.NT.Wdf]
+KmdfService=MultiSeatKeyboardFilter,MsklWdf
+
+[MsklWdf]
+KmdfLibraryVersion=1.31
+
+[MsklService]
+DisplayName=%ServiceDescription%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\MultiSeatKeyboardFilter.sys
+
+[MsklCopyFiles]
+MultiSeatKeyboardFilter.sys
+
+[DestinationDirs]
+DefaultDestDir=13
+
+[SourceDisksFiles]
+MultiSeatKeyboardFilter.sys=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[Strings]
+Provider="MultiSeat Lite"
+DeviceDescription="MultiSeat Lite device-specific keyboard filter"
+ServiceDescription="MultiSeat Lite keyboard filter"
+DiskName="MultiSeat Lite keyboard filter package"

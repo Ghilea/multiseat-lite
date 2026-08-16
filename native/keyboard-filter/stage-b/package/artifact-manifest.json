@@ -1,0 +1,56 @@
+﻿{
+    "schemaVersion":  1,
+    "generatedAtUtc":  "2026-08-15T19:03:42.7144327Z",
+    "classification":  "DEVELOPMENT_NOT_CERTIFICATION",
+    "driver":  {
+                   "name":  "MultiSeatKeyboardFilter",
+                   "version":  "0.1.0.0",
+                   "configuration":  "Release",
+                   "architecture":  "x64",
+                   "kmdfVersion":  "1.31",
+                   "suppressionCapability":  "DisabledByBuild"
+               },
+    "source":  {
+                   "gitCommit":  "unavailable"
+               },
+    "toolchain":  {
+                      "msvcVersion":  "14.44.35207",
+                      "wdkVersion":  "10.0.26100.6584",
+                      "codeqlCliVersion":  "2.26.2",
+                      "windowsDriversPack":  "1.10.0",
+                      "microsoftCppQueriesPack":  "0.0.5"
+                  },
+    "validation":  {
+                       "prefast":  "Pass",
+                       "infVerif":  "Pass",
+                       "codeql":  {
+                                      "mustfix":  {
+                                                      "result":  "Pass",
+                                                      "findings":  0,
+                                                      "sarif":  "mustfix.sarif"
+                                                  },
+                                      "mustrun":  {
+                                                      "result":  "Pass",
+                                                      "findings":  0,
+                                                      "sarif":  "mustrun.sarif"
+                                                  },
+                                      "recommended":  {
+                                                          "result":  "Pass",
+                                                          "findings":  0,
+                                                          "sarif":  "recommended.sarif"
+                                                      }
+                                  },
+                       "codeqlExtraction":  {
+                                                "result":  "CompletedWithNonFatalWdkHeaderDiagnostic",
+                                                "wdkPointerParserDiagnosticCount":  1,
+                                                "note":  "CodeQL completed successfully; count records the known parser diagnostic at WDK wdm.h EXTENDED_CREATE_INFORMATION_32, not a query finding."
+                                            },
+                       "passThroughInvariant":  "Pass"
+                   },
+    "sha256":  {
+                   "driver/MultiSeatKeyboardFilter.sys":  "fe2032998f83724188163eb3eaea9d91196c486dfd4230a43963d684496fc5db",
+                   "driver/MultiSeatKeyboardFilter.pdb":  "4a10dabb2c2e8dc0e94c2754204c69500a4d402fe8a6587aa42f59cb0f509960",
+                   "templates/MultiSeatKeyboardFilter.inf.template":  "2811e0bc027ac7ba3e8be13bdf2747a822ba3728f29f9b892ae4b3ac8275208f",
+                   "validation/MultiSeatKeyboardFilter.validation.inf":  "c26d036df6de2c0e56e5f4ec59c110080ae8003020de4b7f4d53cb7ec0caffc0"
+               }
+}

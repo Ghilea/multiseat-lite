@@ -1,0 +1,2 @@
+D:\multiseat lite\native\keyboard-filter\build\Release\x64\MultiSeatKeyboardFilter.sys.lastcodeanalysissucceeded
+D:\multiseat lite\native\keyboard-filter\build\obj\Release\x64\NativeCodeAnalysis.read.1.tlog

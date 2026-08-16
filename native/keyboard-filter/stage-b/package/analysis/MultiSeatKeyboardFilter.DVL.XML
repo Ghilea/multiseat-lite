@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?> 
+<Data version="1.1.0.0"> 
+<AssessmentScore ScoreName="MultiSeatKeyboardFilter.x64.SDV.NORUN" ScoreValue="0" ScoreUnit="" />
+
+<AssessmentScore ScoreName="MultiSeatKeyboardFilter.x64.CodeAnalysis.NORUN" ScoreValue="0" ScoreUnit="" />
+
+<AssessmentScore ScoreName="MultiSeatKeyboardFilter.x64.Semmle.Summary" ScoreValue="1" ScoreUnit="Types of defects seen and/or rules not run" />
+<AssessmentScore ScoreName="MultiSeatKeyboardFilter.x64.Semmle.Defect.cpp/uninitializedptrfield" ScoreValue="1" ScoreUnit="SEMMLE_MUSTRUN_SKIPPED" />
+
+<AssessmentScore ScoreName="MultiSeatKeyboardFilter.X64.General.Checksum" ScoreValue="joocwyKVMh1cJSmMVNlC8wJndyvMkM7att8f99T+IgTPWnTkygnDw/At7/okNITk/7IRmmq2mzVGsEjBxF5PnA==" ScoreUnit="DVL Checksum Value" />
+</Data>

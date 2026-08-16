@@ -1,0 +1,13 @@
+﻿MultiSeatKeyboardFilter Stage A development validation
+CodeQL CLI: 2.26.2
+microsoft/windows-drivers: 1.10.0
+microsoft/cpp-queries resolved by pack: 0.0.5
+Must-Fix findings: 0
+Must-Run findings: 0
+Recommended findings: 0
+WDK header extractor parser diagnostics: 1 (non-query diagnostic; see manifest)
+PREfast/DriverMinimumRules: Pass
+InfVerif /v /w: Pass
+SuppressionCapability: DisabledByBuild
+Classification: DEVELOPMENT / NOT CERTIFICATION
+No driver was installed, registered, loaded, or bound.
