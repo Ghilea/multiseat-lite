@@ -1,10 +1,13 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     process::{Command, Output},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -14,6 +17,7 @@ mod focus_protection;
 mod installation;
 mod keyboard_sink;
 mod mouse_integration;
+mod presentation;
 pub use creation::*;
 use focus_protection::{FocusProtectionBackend, ManagedVmWindowIdentity};
 pub use installation::*;
@@ -21,6 +25,11 @@ pub use keyboard_sink::VirtualBoxGuestKeyboardSink;
 use mouse_integration::MouseIntegrationController;
 pub use mouse_integration::{
     MouseIntegrationControl, MouseIntegrationState, MouseIntegrationStatus,
+};
+use presentation::PresentationBackend;
+pub use presentation::{
+    DisplayPresentationStatus, PresentationFailureReason, PresentationMode, PresentationState,
+    PresentationTraceEntry, WindowCandidateDiagnostic,
 };
 
 use crate::{
@@ -125,6 +134,7 @@ pub struct RuntimeComponentStatus {
     pub usb: RuntimeUsbDiagnostic,
     pub routing_strategy: InputRoutingStrategy,
     pub routing_status: InputRoutingRuntimeStatus,
+    pub successful_guest_sends: Option<u64>,
     pub usb_passthrough_safety: UsbPassthroughSafety,
     pub safety_reason: Option<String>,
 }
@@ -200,6 +210,8 @@ pub struct SeatRuntimeSnapshot {
     pub vm_started_by_multiseat: bool,
     pub keyboard: RuntimeComponentStatus,
     pub mouse: RuntimeComponentStatus,
+    pub display_presentation: DisplayPresentationStatus,
+    pub startup_trace: Vec<StartupTraceEntry>,
     pub input_isolation: ManagedInputIsolationStatus,
     pub message: Option<String>,
     pub logs: Vec<RuntimeLogEntry>,
@@ -268,7 +280,23 @@ pub struct RuntimeLogEntry {
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartupTraceEntry {
+    pub stage: String,
+    pub timestamp_ms: u64,
+    pub elapsed_ms: u64,
+    pub duration_ms: Option<u64>,
+    pub detail: Option<String>,
+    pub error: Option<String>,
+    pub process_id: Option<u32>,
+    pub window_handle: Option<isize>,
+    pub target_display_id: Option<String>,
+    pub target_bounds: Option<crate::displays::DisplayBounds>,
+    pub exit_status: Option<i32>,
+}
+
+#[derive(Clone, Debug)]
 struct RuntimeRecord {
     vm_started_by_multiseat: bool,
     attached: Vec<ManagedAttachment>,
@@ -277,6 +305,26 @@ struct RuntimeRecord {
     transitional: Option<SeatRuntimeStatus>,
     display_mode: ManagedSeatDisplayMode,
     mouse_integration: MouseIntegrationStatus,
+    keyboard_routing_status: InputRoutingRuntimeStatus,
+    startup_started: Option<Instant>,
+    startup_trace: Vec<StartupTraceEntry>,
+}
+
+impl Default for RuntimeRecord {
+    fn default() -> Self {
+        Self {
+            vm_started_by_multiseat: false,
+            attached: Vec::new(),
+            logs: Vec::new(),
+            last_error: None,
+            transitional: None,
+            display_mode: ManagedSeatDisplayMode::default(),
+            mouse_integration: MouseIntegrationStatus::default(),
+            keyboard_routing_status: InputRoutingRuntimeStatus::PrototypeInactive,
+            startup_started: None,
+            startup_trace: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -320,7 +368,10 @@ pub struct VirtualBoxRuntimeService {
     records: Mutex<HashMap<String, RuntimeRecord>>,
     focus_protection: Box<dyn FocusProtectionBackend>,
     mouse_integration: Box<dyn MouseIntegrationController>,
+    presentation: Box<dyn PresentationBackend>,
     refresh_physical_hardware: bool,
+    asynchronous_starts: Mutex<HashSet<String>>,
+    start_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl VirtualBoxRuntimeService {
@@ -330,11 +381,13 @@ impl VirtualBoxRuntimeService {
                 Box::new(executor),
                 focus_protection::native_backend(),
                 mouse_integration::documented_backend(),
+                presentation::native_backend(),
             ),
             Err(error) => Self::with_components(
                 Box::new(UnavailableExecutor(error)),
                 focus_protection::native_backend(),
                 mouse_integration::documented_backend(),
+                presentation::native_backend(),
             ),
         };
         service.refresh_physical_hardware = true;
@@ -346,6 +399,7 @@ impl VirtualBoxRuntimeService {
             Box::new(ProcessVBoxManageExecutor::discover()?),
             focus_protection::native_backend(),
             mouse_integration::documented_backend(),
+            presentation::native_backend(),
         );
         service.refresh_physical_hardware = true;
         Ok(service)
@@ -356,6 +410,7 @@ impl VirtualBoxRuntimeService {
             executor,
             Box::new(focus_protection::SimulatedFocusProtection::default()),
             mouse_integration::simulated_backend(),
+            Box::new(presentation::SimulatedPresentation::default()),
         )
     }
 
@@ -363,13 +418,17 @@ impl VirtualBoxRuntimeService {
         executor: Box<dyn VBoxManageExecutor>,
         focus_protection: Box<dyn FocusProtectionBackend>,
         mouse_integration: Box<dyn MouseIntegrationController>,
+        presentation: Box<dyn PresentationBackend>,
     ) -> Self {
         Self {
             executor,
             records: Mutex::new(HashMap::new()),
             focus_protection,
             mouse_integration,
+            presentation,
             refresh_physical_hardware: false,
+            asynchronous_starts: Mutex::new(HashSet::new()),
+            start_cancellations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -377,6 +436,140 @@ impl VirtualBoxRuntimeService {
         self.with_record(seat_id, |record| {
             record.last_error = Some(error.to_owned());
             record.transitional = Some(SeatRuntimeStatus::Error);
+        })
+    }
+
+    pub fn begin_asynchronous_start(
+        &self,
+        seat_id: &SeatId,
+        configuration: &ApplicationConfig,
+    ) -> Result<(Arc<AtomicBool>, SeatRuntimeSnapshot), String> {
+        {
+            let mut starts = self
+                .asynchronous_starts
+                .lock()
+                .map_err(|_| "VirtualBox asynchronous-start lock is poisoned")?;
+            if !starts.insert(seat_id.0.clone()) {
+                return Err(format!("seat '{}' is already starting", seat_id.0));
+            }
+        }
+        let cancellation = Arc::new(AtomicBool::new(false));
+        self.start_cancellations
+            .lock()
+            .map_err(|_| "VirtualBox start-cancellation lock is poisoned")?
+            .insert(seat_id.0.clone(), cancellation.clone());
+        self.replace_record(
+            seat_id,
+            RuntimeRecord {
+                transitional: Some(SeatRuntimeStatus::Starting),
+                startup_started: Some(Instant::now()),
+                ..RuntimeRecord::default()
+            },
+        )?;
+        self.trace(seat_id, "StartRequested", None, None)?;
+        self.trace(
+            seat_id,
+            "StartCommandReturned",
+            Some("startup accepted; activation continues on a background worker"),
+            None,
+        )?;
+        Ok((
+            cancellation,
+            self.accepted_start_snapshot(seat_id, configuration)?,
+        ))
+    }
+
+    pub fn finish_asynchronous_start(&self, seat_id: &SeatId) {
+        if let Ok(mut starts) = self.asynchronous_starts.lock() {
+            starts.remove(&seat_id.0);
+        }
+        if let Ok(mut cancellations) = self.start_cancellations.lock() {
+            cancellations.remove(&seat_id.0);
+        }
+    }
+
+    pub fn cancel_asynchronous_start(&self, seat_id: &SeatId) {
+        if let Ok(cancellations) = self.start_cancellations.lock() {
+            if let Some(cancellation) = cancellations.get(&seat_id.0) {
+                cancellation.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    pub fn set_keyboard_routing_runtime(
+        &self,
+        seat_id: &SeatId,
+        status: InputRoutingRuntimeStatus,
+        detail: &str,
+    ) -> Result<(), String> {
+        self.with_record(seat_id, |record| record.keyboard_routing_status = status)?;
+        self.log(
+            seat_id,
+            "keyboard-routing",
+            if matches!(
+                status,
+                InputRoutingRuntimeStatus::Active | InputRoutingRuntimeStatus::PrototypeActive
+            ) {
+                "active"
+            } else {
+                "error"
+            },
+            None,
+            None,
+            detail,
+        )
+    }
+
+    pub fn record_startup_stage(
+        &self,
+        seat_id: &SeatId,
+        stage: &str,
+        detail: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        self.trace(seat_id, stage, detail, error)
+    }
+
+    pub fn record_startup_duration(
+        &self,
+        seat_id: &SeatId,
+        stage: &str,
+        started: Instant,
+        detail: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        self.trace_detailed(seat_id, stage, detail, error, Some(started.elapsed()), None)
+    }
+
+    fn accepted_start_snapshot(
+        &self,
+        seat_id: &SeatId,
+        configuration: &ApplicationConfig,
+    ) -> Result<SeatRuntimeSnapshot, String> {
+        let routing = configuration.input_routing(seat_id);
+        let keyboard_id = target_device_id(seat_id, configuration, InputKind::Keyboard);
+        let mouse_id = target_device_id(seat_id, configuration, InputKind::Mouse);
+        let record = self.record(seat_id)?;
+        Ok(SeatRuntimeSnapshot {
+            seat_id: seat_id.0.clone(),
+            status: SeatRuntimeStatus::Starting,
+            vm_id: configured_vm_id(seat_id, configuration)
+                .ok()
+                .map(str::to_owned),
+            vm_state: Some("start-requested".to_owned()),
+            vm_started_by_multiseat: false,
+            keyboard: pending_component(keyboard_id, routing.keyboard, &record),
+            mouse: pending_component(mouse_id, routing.mouse, &record),
+            display_presentation: DisplayPresentationStatus {
+                state: PresentationState::WaitingForVmWindow,
+                assigned_display_id: configured_display_id(seat_id, configuration)
+                    .map(str::to_owned),
+                ..DisplayPresentationStatus::default()
+            },
+            startup_trace: record.startup_trace.clone(),
+            input_isolation: ManagedInputIsolationStatus::default(),
+            message: Some("Start accepted; VM and seat components are starting".to_owned()),
+            logs: record.logs,
         })
     }
 
@@ -468,6 +661,7 @@ impl VirtualBoxRuntimeService {
         let integration = self
             .mouse_integration
             .request(&backend.vm_id, MouseIntegrationState::Enabled)?;
+        self.presentation.set_locked(false)?;
         self.focus_protection.set_locked(false)?;
         self.with_record(seat_id, |record| {
             record.display_mode = ManagedSeatDisplayMode::NormalVirtualBox;
@@ -498,6 +692,7 @@ impl VirtualBoxRuntimeService {
         let integration = self
             .mouse_integration
             .request(&backend.vm_id, MouseIntegrationState::Disabled)?;
+        self.start_managed_presentation(seat_id, configuration, &vm);
         self.focus_protection.start(
             ManagedVmWindowIdentity {
                 vm_uuid: vm.uuid,
@@ -522,7 +717,35 @@ impl VirtualBoxRuntimeService {
     }
 
     pub fn shutdown_focus_protection(&self) -> Result<(), String> {
+        self.presentation.stop()?;
         self.focus_protection.stop()
+    }
+
+    fn start_managed_presentation(
+        &self,
+        seat_id: &SeatId,
+        configuration: &ApplicationConfig,
+        vm: &VirtualMachine,
+    ) {
+        let Some(display_id) = configured_display_id(seat_id, configuration) else {
+            let _ = self.presentation.mark_unavailable(
+                None,
+                "seat has no assigned physical display; VM remains running".to_owned(),
+            );
+            return;
+        };
+        if let Err(error) = self.presentation.start(
+            ManagedVmWindowIdentity {
+                vm_uuid: vm.uuid.clone(),
+                vm_name: vm.name.clone(),
+                session_pid: vm.session_pid,
+            },
+            display_id.to_owned(),
+        ) {
+            let _ = self
+                .presentation
+                .mark_unavailable(Some(display_id.to_owned()), error);
+        }
     }
 
     fn set_mouse_capture_policy(&self, vm_id: &str, policy: &str) -> Result<(), String> {
@@ -557,8 +780,38 @@ impl VirtualBoxRuntimeService {
         physical_devices: &[PhysicalInputDevice],
         focus_anchor: Option<isize>,
     ) -> Result<SeatRuntimeSnapshot, String> {
-        let result = self.start_inner(seat_id, configuration, physical_devices, focus_anchor);
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let result = self.start_inner(
+            seat_id,
+            configuration,
+            physical_devices,
+            focus_anchor,
+            &cancellation,
+        );
         if result.is_err() {
+            let _ = self.presentation.stop();
+            let _ = self.focus_protection.stop();
+        }
+        result
+    }
+
+    pub fn start_with_cancellation(
+        &self,
+        seat_id: &SeatId,
+        configuration: &ApplicationConfig,
+        physical_devices: &[PhysicalInputDevice],
+        focus_anchor: Option<isize>,
+        cancellation: &Arc<AtomicBool>,
+    ) -> Result<SeatRuntimeSnapshot, String> {
+        let result = self.start_inner(
+            seat_id,
+            configuration,
+            physical_devices,
+            focus_anchor,
+            cancellation,
+        );
+        if result.is_err() {
+            let _ = self.presentation.stop();
             let _ = self.focus_protection.stop();
         }
         result
@@ -570,7 +823,9 @@ impl VirtualBoxRuntimeService {
         configuration: &ApplicationConfig,
         physical_devices: &[PhysicalInputDevice],
         focus_anchor: Option<isize>,
+        cancellation: &Arc<AtomicBool>,
     ) -> Result<SeatRuntimeSnapshot, String> {
+        self.check_start_cancelled(cancellation)?;
         let inputs = validate_activation(seat_id, configuration, physical_devices)?;
         let vm_id = configured_vm_id(seat_id, configuration)?.to_owned();
         let vm = self.inspect_vm(&vm_id)?;
@@ -580,13 +835,20 @@ impl VirtualBoxRuntimeService {
         }
         let vm_already_running = vm.state.eq_ignore_ascii_case("running");
 
-        self.replace_record(
-            seat_id,
-            RuntimeRecord {
-                transitional: Some(SeatRuntimeStatus::Starting),
-                ..RuntimeRecord::default()
-            },
-        )?;
+        self.with_record(seat_id, |record| {
+            record.transitional = Some(SeatRuntimeStatus::Starting);
+            record.last_error = None;
+            record.attached.clear();
+            record.logs.clear();
+            record.keyboard_routing_status = InputRoutingRuntimeStatus::PrototypeInactive;
+            if record.startup_started.is_none() {
+                record.startup_started = Some(Instant::now());
+                record.startup_trace.clear();
+            }
+        })?;
+        if self.record(seat_id)?.startup_trace.is_empty() {
+            self.trace(seat_id, "StartRequested", None, None)?;
+        }
         self.log(
             seat_id,
             "activation",
@@ -605,32 +867,26 @@ impl VirtualBoxRuntimeService {
             .is_some_and(|backend| backend.managed_by_multiseat);
         if managed {
             self.set_mouse_capture_policy(&vm_id, "Disabled")?;
-            self.focus_protection.start(
-                ManagedVmWindowIdentity {
-                    vm_uuid: vm.uuid.clone(),
-                    vm_name: vm.name.clone(),
-                    session_pid: vm.session_pid,
-                },
-                focus_anchor,
-            )?;
             self.with_record(seat_id, |record| {
                 record.display_mode = ManagedSeatDisplayMode::SeatDisplayLocked
             })?;
-            self.log(
-                seat_id,
-                "focus-protection",
-                "active",
-                None,
-                None,
-                "managed VirtualBox window focus protection enabled",
-            )?;
         }
 
         let routing = configuration.input_routing(seat_id);
         // Preflight is deliberately fresh for every activation. Its UUIDs are validation-only.
         self.resolve_required_usb(&inputs, &routing, configuration)?;
+        self.check_start_cancelled(cancellation)?;
         if !vm_already_running {
-            self.checked(&["startvm", &vm_id, "--type", "gui"])?;
+            let vm_start_started = Instant::now();
+            let output = self.checked(&["startvm", &vm_id, "--type", "gui"])?;
+            self.trace_detailed(
+                seat_id,
+                "VMStartRequested",
+                Some(&vm_id),
+                None,
+                Some(vm_start_started.elapsed()),
+                output.exit_code,
+            )?;
             self.with_record(seat_id, |record| record.vm_started_by_multiseat = true)?;
             self.log(
                 seat_id,
@@ -650,9 +906,26 @@ impl VirtualBoxRuntimeService {
                 "VM was already running",
             )?;
         }
-        self.wait_for_vm_state(&vm_id, "running", 40)?;
+        let vm_wait_started = Instant::now();
+        self.wait_for_vm_state_cancellable(&vm_id, "running", 40, cancellation)?;
+        self.trace_detailed(
+            seat_id,
+            "VMRunningObserved",
+            Some(&vm_id),
+            None,
+            Some(vm_wait_started.elapsed()),
+            None,
+        )?;
+        self.check_start_cancelled(cancellation)?;
         if managed {
             let running_vm = self.inspect_vm(&vm_id)?;
+            self.start_managed_presentation(seat_id, configuration, &running_vm);
+            self.trace(
+                seat_id,
+                "PresentationWorkerStarted",
+                configured_display_id(seat_id, configuration),
+                None,
+            )?;
             self.focus_protection.start(
                 ManagedVmWindowIdentity {
                     vm_uuid: running_vm.uuid,
@@ -661,6 +934,7 @@ impl VirtualBoxRuntimeService {
                 },
                 focus_anchor,
             )?;
+            self.trace(seat_id, "FocusProtectionActive", None, None)?;
             let integration = self
                 .mouse_integration
                 .request(&vm_id, MouseIntegrationState::Disabled)?;
@@ -699,6 +973,11 @@ impl VirtualBoxRuntimeService {
                 )?;
                 continue;
             }
+            let attach_started = (kind == InputKind::Mouse).then(Instant::now);
+            if kind == InputKind::Mouse {
+                self.trace(seat_id, "MouseAttachStarted", Some(&physical.id), None)?;
+            }
+            self.check_start_cancelled(cancellation)?;
             let resolved = self.resolve_single_usb(physical)?;
             if let Err(error) =
                 self.attach(seat_id, &vm_id, kind, physical, &resolved, physical_devices)
@@ -719,6 +998,16 @@ impl VirtualBoxRuntimeService {
                 })?;
                 return Err(message);
             }
+            if let Some(attach_started) = attach_started {
+                self.trace_detailed(
+                    seat_id,
+                    "MouseCaptured",
+                    Some(&physical.id),
+                    None,
+                    Some(attach_started.elapsed()),
+                    None,
+                )?;
+            }
         }
         self.with_record(seat_id, |record| record.transitional = None)?;
         self.status(seat_id, configuration, physical_devices)
@@ -730,6 +1019,8 @@ impl VirtualBoxRuntimeService {
         configuration: &ApplicationConfig,
         physical_devices: &[PhysicalInputDevice],
     ) -> Result<SeatRuntimeSnapshot, String> {
+        self.cancel_asynchronous_start(seat_id);
+        self.presentation.stop()?;
         self.focus_protection.stop()?;
         let vm_id = configured_vm_id(seat_id, configuration)?.to_owned();
         let restored_integration = self.mouse_integration.restore_if_owned(&vm_id)?;
@@ -883,7 +1174,7 @@ impl VirtualBoxRuntimeService {
             (Err(error), Some(_)) => Err(error.clone()),
             (_, None) => Ok(None),
         };
-        let keyboard = component_status(
+        let mut keyboard = component_status(
             keyboard_id,
             InputKind::Keyboard,
             &record,
@@ -894,6 +1185,9 @@ impl VirtualBoxRuntimeService {
                 configuration.device_safety(id, DeviceRoutingBackend::VirtualBoxUsbPassthrough)
             }),
         );
+        if routing.keyboard == InputRoutingStrategy::NativeKeyboardRouting {
+            keyboard.routing_status = record.keyboard_routing_status;
+        }
         let mouse = component_status(
             mouse_id,
             InputKind::Mouse,
@@ -914,6 +1208,7 @@ impl VirtualBoxRuntimeService {
             None => (None, None),
         };
         let focus = self.focus_protection.status();
+        let display_presentation = self.presentation.status();
         let host = configuration.seats.first();
         let dennis_keyboard_attached = host
             .and_then(|seat| seat.devices.keyboard.as_ref())
@@ -944,6 +1239,8 @@ impl VirtualBoxRuntimeService {
             .is_some_and(|policy| policy.eq_ignore_ascii_case("Disabled"));
         let managed = backend.is_some_and(|item| item.managed_by_multiseat);
         let mouse_integration = record.mouse_integration.clone();
+        let presentation_healthy =
+            !managed || display_presentation.state == PresentationState::Presented;
         let mouse_isolation =
             if !managed || record.display_mode != ManagedSeatDisplayMode::SeatDisplayLocked {
                 MouseIsolationStatus::Inactive
@@ -977,6 +1274,7 @@ impl VirtualBoxRuntimeService {
                     && !dennis_keyboard_attached
                     && !dennis_mouse_attached
                     && isolation_healthy
+                    && presentation_healthy
                 {
                     SeatRuntimeStatus::Running
                 } else {
@@ -994,6 +1292,8 @@ impl VirtualBoxRuntimeService {
             vm_started_by_multiseat: record.vm_started_by_multiseat,
             keyboard,
             mouse,
+            display_presentation,
+            startup_trace: record.startup_trace.clone(),
             input_isolation: ManagedInputIsolationStatus {
                 display_mode: record.display_mode,
                 mouse_capture_policy,
@@ -1332,7 +1632,23 @@ impl VirtualBoxRuntimeService {
     }
 
     fn wait_for_vm_state(&self, vm_id: &str, desired: &str, attempts: usize) -> Result<(), String> {
+        self.wait_for_vm_state_cancellable(
+            vm_id,
+            desired,
+            attempts,
+            &Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn wait_for_vm_state_cancellable(
+        &self,
+        vm_id: &str,
+        desired: &str,
+        attempts: usize,
+        cancellation: &Arc<AtomicBool>,
+    ) -> Result<(), String> {
         for _ in 0..attempts {
+            self.check_start_cancelled(cancellation)?;
             if self.inspect_vm(vm_id)?.state.eq_ignore_ascii_case(desired) {
                 return Ok(());
             }
@@ -1341,6 +1657,14 @@ impl VirtualBoxRuntimeService {
         Err(format!(
             "VM {vm_id} did not reach state '{desired}' in time"
         ))
+    }
+
+    fn check_start_cancelled(&self, cancellation: &Arc<AtomicBool>) -> Result<(), String> {
+        if cancellation.load(Ordering::Acquire) {
+            Err("managed seat startup was cancelled".to_owned())
+        } else {
+            Ok(())
+        }
     }
 
     fn checked(&self, arguments: &[&str]) -> Result<VBoxOutput, String> {
@@ -1443,6 +1767,52 @@ impl VirtualBoxRuntimeService {
             })
         })
     }
+
+    fn trace(
+        &self,
+        seat_id: &SeatId,
+        stage: &str,
+        detail: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        self.trace_detailed(seat_id, stage, detail, error, None, None)
+    }
+
+    fn trace_detailed(
+        &self,
+        seat_id: &SeatId,
+        stage: &str,
+        detail: Option<&str>,
+        error: Option<&str>,
+        duration: Option<Duration>,
+        exit_status: Option<i32>,
+    ) -> Result<(), String> {
+        self.with_record(seat_id, |record| {
+            let started = record.startup_started.get_or_insert_with(Instant::now);
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|value| u64::try_from(value.as_millis()).ok())
+                .unwrap_or_default();
+            if record.startup_trace.len() >= 128 {
+                record.startup_trace.remove(0);
+            }
+            record.startup_trace.push(StartupTraceEntry {
+                stage: stage.to_owned(),
+                timestamp_ms,
+                elapsed_ms,
+                duration_ms: duration.and_then(|value| u64::try_from(value.as_millis()).ok()),
+                detail: detail.map(str::to_owned),
+                error: error.map(str::to_owned),
+                process_id: None,
+                window_handle: None,
+                target_display_id: None,
+                target_bounds: None,
+                exit_status,
+            });
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1451,16 +1821,103 @@ mod runtime_tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     };
+    use std::time::{Duration, Instant};
 
     use crate::{
         devices::InputCapabilities,
         seats::{
-            DeviceBackendSafetyRecord, DeviceRoutingBackend, PhysicalDeviceId, SeatInputRouting,
-            UsbPassthroughSafety, VirtualBoxSeatConfig,
+            DeviceBackendSafetyRecord, DeviceRoutingBackend, DisplayId, PhysicalDeviceId,
+            SeatInputRouting, UsbPassthroughSafety, VirtualBoxSeatConfig,
         },
     };
 
     use super::*;
+
+    #[test]
+    fn asynchronous_start_is_accepted_immediately_and_duplicate_is_refused() {
+        let fake = FakeExecutor::default();
+        let service = service(&fake);
+        let seat_id = SeatId("seat-2".into());
+        let started = Instant::now();
+        let (cancellation, snapshot) = service
+            .begin_asynchronous_start(&seat_id, &configuration())
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(snapshot.status, SeatRuntimeStatus::Starting);
+        assert_eq!(snapshot.vm_state.as_deref(), Some("start-requested"));
+        assert!(snapshot
+            .startup_trace
+            .iter()
+            .any(|entry| entry.stage == "StartCommandReturned"));
+        assert!(service
+            .begin_asynchronous_start(&seat_id, &configuration())
+            .unwrap_err()
+            .contains("already starting"));
+        service.cancel_asynchronous_start(&seat_id);
+        assert!(cancellation.load(Ordering::Acquire));
+        service.finish_asynchronous_start(&seat_id);
+    }
+
+    #[test]
+    fn startup_trace_is_bounded() {
+        let fake = FakeExecutor::default();
+        let service = service(&fake);
+        let seat_id = SeatId("seat-2".into());
+        for index in 0..140 {
+            service
+                .record_startup_stage(
+                    &seat_id,
+                    "WindowDiscoveryAttempt",
+                    Some(&index.to_string()),
+                    None,
+                )
+                .unwrap();
+        }
+        let record = service.record(&seat_id).unwrap();
+        assert_eq!(record.startup_trace.len(), 128);
+        assert_eq!(
+            record.startup_trace.first().unwrap().detail.as_deref(),
+            Some("12")
+        );
+    }
+
+    #[test]
+    fn keyboard_and_mouse_can_be_active_while_presentation_is_still_waiting() {
+        let fake = FakeExecutor::default();
+        let service = VirtualBoxRuntimeService::with_components(
+            Box::new(fake.clone()),
+            Box::new(focus_protection::SimulatedFocusProtection::default()),
+            mouse_integration::simulated_backend(),
+            Box::new(WaitingPresentation::default()),
+        );
+        let config = configuration();
+        service
+            .start(&SeatId("seat-2".into()), &config, &devices(), None)
+            .unwrap();
+        service
+            .set_keyboard_routing_runtime(
+                &SeatId("seat-2".into()),
+                InputRoutingRuntimeStatus::Active,
+                "test router active",
+            )
+            .unwrap();
+        let status = service
+            .status(&SeatId("seat-2".into()), &config, &devices())
+            .unwrap();
+        assert_eq!(
+            status.display_presentation.state,
+            PresentationState::WaitingForVmWindow
+        );
+        assert_eq!(
+            status.keyboard.routing_status,
+            InputRoutingRuntimeStatus::Active
+        );
+        assert_eq!(
+            status.mouse.routing_status,
+            InputRoutingRuntimeStatus::Active
+        );
+        assert_eq!(status.status, SeatRuntimeStatus::PartiallyRunning);
+    }
 
     #[derive(Default)]
     struct FakeState {
@@ -1477,6 +1934,56 @@ mod runtime_tests {
 
     #[derive(Clone, Default)]
     struct FakeExecutor(Arc<FakeState>);
+
+    #[derive(Default)]
+    struct WaitingPresentation(Mutex<DisplayPresentationStatus>);
+
+    impl PresentationBackend for WaitingPresentation {
+        fn start(
+            &self,
+            _target: ManagedVmWindowIdentity,
+            assigned_display_id: String,
+        ) -> Result<(), String> {
+            *self.0.lock().unwrap() = DisplayPresentationStatus {
+                state: PresentationState::WaitingForVmWindow,
+                assigned_display_id: Some(assigned_display_id),
+                ..DisplayPresentationStatus::default()
+            };
+            Ok(())
+        }
+
+        fn set_locked(&self, locked: bool) -> Result<(), String> {
+            self.0.lock().unwrap().state = if locked {
+                PresentationState::WaitingForVmWindow
+            } else {
+                PresentationState::NotPresented
+            };
+            Ok(())
+        }
+
+        fn mark_unavailable(
+            &self,
+            assigned_display_id: Option<String>,
+            message: String,
+        ) -> Result<(), String> {
+            *self.0.lock().unwrap() = DisplayPresentationStatus {
+                state: PresentationState::PresentationUnavailable,
+                assigned_display_id,
+                last_error: Some(message),
+                ..DisplayPresentationStatus::default()
+            };
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), String> {
+            *self.0.lock().unwrap() = DisplayPresentationStatus::default();
+            Ok(())
+        }
+
+        fn status(&self) -> DisplayPresentationStatus {
+            self.0.lock().unwrap().clone()
+        }
+    }
 
     impl VBoxManageExecutor for FakeExecutor {
         fn execute(&self, arguments: &[String]) -> Result<VBoxOutput, String> {
@@ -1608,6 +2115,7 @@ mod runtime_tests {
         config.seats[0].devices.mouse = Some(PhysicalDeviceId("dennis-mouse".into()));
         config.seats[1].devices.keyboard = Some(PhysicalDeviceId("barnen-keyboard".into()));
         config.seats[1].devices.mouse = Some(PhysicalDeviceId("barnen-mouse".into()));
+        config.seats[1].devices.display = Some(DisplayId("barnen-display".into()));
         config.backends.virtual_box.seats.insert(
             "seat-2".into(),
             VirtualBoxSeatConfig {
@@ -1937,6 +2445,14 @@ mod runtime_tests {
             MouseIsolationStatus::Inactive
         );
         assert!(!unlocked.input_isolation.focus_protection_locked);
+        assert_eq!(
+            unlocked.display_presentation.mode,
+            PresentationMode::ConventionalWindow
+        );
+        assert_eq!(
+            unlocked.display_presentation.state,
+            PresentationState::NotPresented
+        );
         assert!(unlocked.keyboard.attached && unlocked.mouse.attached);
 
         let locked = service
@@ -1952,6 +2468,14 @@ mod runtime_tests {
             locked.input_isolation.mouse_isolation,
             MouseIsolationStatus::Active
         );
+        assert_eq!(
+            locked.display_presentation.mode,
+            PresentationMode::Borderless
+        );
+        assert_eq!(
+            locked.display_presentation.state,
+            PresentationState::Presented
+        );
 
         service
             .allow_host_input_temporarily(&SeatId("seat-2".into()), &config, &devices())
@@ -1961,6 +2485,10 @@ mod runtime_tests {
             .unwrap();
         assert!(restarted.input_isolation.mouse_capture_disabled);
         assert!(restarted.input_isolation.focus_protection_locked);
+        assert_eq!(
+            restarted.display_presentation.state,
+            PresentationState::Presented
+        );
     }
 
     #[test]
@@ -2087,6 +2615,18 @@ fn configured_vm_id<'a>(
         .get(&seat_id.0)
         .map(|item| item.vm_id.as_str())
         .ok_or_else(|| format!("seat '{}' has no VirtualBox VM selected", seat_id.0))
+}
+
+fn configured_display_id<'a>(
+    seat_id: &SeatId,
+    configuration: &'a ApplicationConfig,
+) -> Option<&'a str> {
+    configuration
+        .seats
+        .iter()
+        .find(|seat| &seat.id == seat_id)
+        .and_then(|seat| seat.devices.display.as_ref())
+        .map(|display| display.0.as_str())
 }
 
 fn managed_backend<'a>(
@@ -2308,6 +2848,38 @@ fn target_device_id<'a>(
         .map(|id| id.0.as_str())
 }
 
+fn pending_component(
+    id: Option<&str>,
+    routing_strategy: InputRoutingStrategy,
+    record: &RuntimeRecord,
+) -> RuntimeComponentStatus {
+    RuntimeComponentStatus {
+        configured: id.is_some(),
+        attached: false,
+        physical_device_id: id.map(str::to_owned),
+        runtime_uuid: None,
+        mapping: None,
+        usb: RuntimeUsbDiagnostic::default(),
+        routing_strategy,
+        routing_status: match routing_strategy {
+            InputRoutingStrategy::NativeKeyboardRouting => record.keyboard_routing_status,
+            InputRoutingStrategy::VirtualBoxUsbPassthrough => {
+                InputRoutingRuntimeStatus::NotImplemented
+            }
+            InputRoutingStrategy::Disabled => InputRoutingRuntimeStatus::Disabled,
+        },
+        successful_guest_sends: None,
+        usb_passthrough_safety: if routing_strategy
+            == InputRoutingStrategy::VirtualBoxUsbPassthrough
+        {
+            UsbPassthroughSafety::Unverified
+        } else {
+            UsbPassthroughSafety::Disabled
+        },
+        safety_reason: None,
+    }
+}
+
 fn component_status(
     id: Option<&str>,
     kind: InputKind,
@@ -2383,6 +2955,7 @@ fn component_status(
         usb,
         routing_strategy,
         routing_status,
+        successful_guest_sends: None,
         usb_passthrough_safety,
         safety_reason: safety_record.map(|record| record.reason.clone()),
     }

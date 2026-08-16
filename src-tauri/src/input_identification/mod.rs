@@ -67,9 +67,14 @@ impl InputIdentificationService {
             target_physical_device_id: None,
             current_session_id: 0,
             real_guest_injection_enabled: false,
+            successful_guest_sends: 0,
             host_input_suppression: "notImplemented".to_owned(),
             transport: KeyboardRoutingTransport::DiagnosticOnly,
         })
+    }
+
+    pub fn keyboard_routing_status(&self) -> Option<KeyboardRoutingDiagnosticStatus> {
+        None
     }
 
     pub fn start_keyboard_injection(

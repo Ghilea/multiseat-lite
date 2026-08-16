@@ -183,6 +183,7 @@ export type RuntimeComponentStatus = {
   mapping: UsbCorrelationState | null;
   routingStrategy: InputRoutingStrategy;
   routingStatus: InputRoutingRuntimeStatus;
+  successfulGuestSends: number | null;
   usbPassthroughSafety: UsbPassthroughSafety;
   safetyReason: string | null;
   usb: {
@@ -211,6 +212,51 @@ export type SeatRuntimeSnapshot = {
   vmStartedByMultiseat: boolean;
   keyboard: RuntimeComponentStatus;
   mouse: RuntimeComponentStatus;
+  displayPresentation: {
+    state: "notPresented" | "waitingForVmWindow" | "resolvingDisplay" | "presenting" | "presented" | "presentationUnavailable" | "error";
+    mode: "borderless" | "conventionalWindow";
+    assignedDisplayId: string | null;
+    displayName: string | null;
+    bounds: { x: number; y: number; width: number; height: number } | null;
+    managedWindowFound: boolean;
+    managedWindowProcessId: number | null;
+    failureReason: "noMatchingVmWindow" | "managedVmPidUnknown" | "displayNotResolved" | "windowStateReadFailed" | "setWindowStyleFailed" | "setWindowPosFailed" | "postconditionVerificationFailed" | null;
+    windowCandidates: Array<{
+      processId: number;
+      windowHandle: number;
+      className: string;
+      title: string;
+      visible: boolean;
+      ownerWindowHandle: number | null;
+      bounds: { x: number; y: number; width: number; height: number } | null;
+    }>;
+    trace: Array<{
+      stage: string;
+      timestampMs: number;
+      elapsedMs: number;
+      durationMs: number | null;
+      detail: string | null;
+      processId: number | null;
+      windowHandle: number | null;
+      targetDisplayId: string | null;
+      targetBounds: { x: number; y: number; width: number; height: number } | null;
+      error: string | null;
+    }>;
+    lastError: string | null;
+  };
+  startupTrace: Array<{
+    stage: string;
+    timestampMs: number;
+    elapsedMs: number;
+    durationMs: number | null;
+    detail: string | null;
+    error: string | null;
+    processId: number | null;
+    windowHandle: number | null;
+    targetDisplayId: string | null;
+    targetBounds: { x: number; y: number; width: number; height: number } | null;
+    exitStatus: number | null;
+  }>;
   inputIsolation: {
     displayMode: "normalVirtualBox" | "seatDisplayLocked";
     mouseCapturePolicy: string | null;
@@ -248,6 +294,7 @@ export type KeyboardRoutingDiagnosticStatus = {
   targetPhysicalDeviceId: string | null;
   currentSessionId: number;
   realGuestInjectionEnabled: boolean;
+  successfulGuestSends: number;
   hostInputSuppression: string;
   transport: "diagnosticOnly" | "virtualBoxScancodePrototype";
 };

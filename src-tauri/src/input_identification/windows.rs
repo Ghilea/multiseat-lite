@@ -2,7 +2,10 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     mem::size_of,
-    sync::{mpsc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Mutex, OnceLock,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -52,15 +55,33 @@ thread_local! {
 
 static WINDOW_CLASS_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
-#[derive(Default)]
 pub struct InputIdentificationService {
     listener: Mutex<Option<ListenerHandle>>,
+    starting: AtomicBool,
+}
+
+impl Default for InputIdentificationService {
+    fn default() -> Self {
+        Self {
+            listener: Mutex::new(None),
+            starting: AtomicBool::new(false),
+        }
+    }
+}
+
+struct ListenerStartGuard<'a>(&'a AtomicBool);
+
+impl Drop for ListenerStartGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 struct ListenerHandle {
     thread_id: u32,
     join: JoinHandle<()>,
     mode: ListenerModeStatus,
+    successful_guest_sends: Option<std::sync::Arc<AtomicU64>>,
 }
 
 enum ListenerModeStatus {
@@ -79,11 +100,13 @@ struct ReportingKeyboardSink {
     app: tauri::AppHandle,
     inner: Box<dyn GuestKeyboardSink + Send>,
     detail: &'static str,
+    successful_guest_sends: std::sync::Arc<AtomicU64>,
 }
 
 impl GuestKeyboardSink for ReportingKeyboardSink {
     fn key_down(&mut self, event: &NormalizedKeyEvent) -> Result<(), String> {
         self.inner.key_down(event)?;
+        self.successful_guest_sends.fetch_add(1, Ordering::Relaxed);
         self.app
             .emit(
                 ROUTING_EVENT_NAME,
@@ -98,6 +121,7 @@ impl GuestKeyboardSink for ReportingKeyboardSink {
 
     fn key_up(&mut self, event: &NormalizedKeyEvent) -> Result<(), String> {
         self.inner.key_up(event)?;
+        self.successful_guest_sends.fetch_add(1, Ordering::Relaxed);
         self.app
             .emit(
                 ROUTING_EVENT_NAME,
@@ -146,6 +170,18 @@ struct EventThrottle {
     last_source: Option<String>,
     last_emitted: Option<Instant>,
     interval: Duration,
+}
+
+fn same_keyboard_router(
+    status: &KeyboardRoutingDiagnosticStatus,
+    target_physical_device_id: &str,
+    transport: KeyboardRoutingTransport,
+) -> bool {
+    status
+        .target_physical_device_id
+        .as_deref()
+        .is_some_and(|id| id.eq_ignore_ascii_case(target_physical_device_id))
+        && status.transport == transport
 }
 
 impl EventThrottle {
@@ -222,6 +258,7 @@ impl InputIdentificationService {
             thread_id,
             join,
             mode: ListenerModeStatus::Identification(status.clone()),
+            successful_guest_sends: None,
         });
         Ok(status)
     }
@@ -260,17 +297,39 @@ impl InputIdentificationService {
         sink: Box<dyn GuestKeyboardSink + Send>,
         transport: KeyboardRoutingTransport,
     ) -> Result<KeyboardRoutingDiagnosticStatus, String> {
-        let mut listener = self
-            .listener
-            .lock()
-            .map_err(|_| "input listener lock is poisoned".to_owned())?;
-        if let Some(existing) = listener.as_ref() {
-            return match &existing.mode {
-                ListenerModeStatus::KeyboardRouting(status) => Ok(status.clone()),
-                ListenerModeStatus::Identification(_) => {
-                    Err("input identification is already active".to_owned())
-                }
-            };
+        if self
+            .starting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("an input listener is already starting".to_owned());
+        }
+        let _start_guard = ListenerStartGuard(&self.starting);
+        {
+            let listener = self
+                .listener
+                .lock()
+                .map_err(|_| "input listener lock is poisoned".to_owned())?;
+            if let Some(existing) = listener.as_ref() {
+                return match &existing.mode {
+                    ListenerModeStatus::KeyboardRouting(status)
+                        if same_keyboard_router(
+                            status,
+                            &target_physical_device_id,
+                            transport,
+                        ) =>
+                    {
+                        Ok(status.clone())
+                    }
+                    ListenerModeStatus::KeyboardRouting(_) => Err(
+                        "another keyboard router is already active; stop it before changing target or transport"
+                            .to_owned(),
+                    ),
+                    ListenerModeStatus::Identification(_) => {
+                        Err("input identification is already active".to_owned())
+                    }
+                };
+            }
         }
         let discovery = devices::enumerate()?;
         let environment = environment::detect(discovery.aster_device_evidence())?;
@@ -305,6 +364,7 @@ impl InputIdentificationService {
             current_session_id: environment.current_session_id,
             real_guest_injection_enabled: transport
                 == KeyboardRoutingTransport::VirtualBoxScancodePrototype,
+            successful_guest_sends: 0,
             host_input_suppression: "notImplemented".to_owned(),
             transport,
         };
@@ -316,10 +376,12 @@ impl InputIdentificationService {
                 "scan code forwarded to the managed VM through VBoxManage keyboardputscancode"
             }
         };
+        let successful_guest_sends = std::sync::Arc::new(AtomicU64::new(0));
         let reporting_sink: Box<dyn GuestKeyboardSink + Send> = Box::new(ReportingKeyboardSink {
             app: app.clone(),
             inner: sink,
             detail,
+            successful_guest_sends: successful_guest_sends.clone(),
         });
         let router = KeyboardRouter::new(target_id, reporting_sink);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
@@ -339,10 +401,14 @@ impl InputIdentificationService {
                 ))
             }
         };
-        *listener = Some(ListenerHandle {
+        *self
+            .listener
+            .lock()
+            .map_err(|_| "input listener lock is poisoned".to_owned())? = Some(ListenerHandle {
             thread_id,
             join,
             mode: ListenerModeStatus::KeyboardRouting(status.clone()),
+            successful_guest_sends: Some(successful_guest_sends),
         });
         Ok(status)
     }
@@ -356,8 +422,26 @@ impl InputIdentificationService {
             target_physical_device_id: None,
             current_session_id: session_id,
             real_guest_injection_enabled: false,
+            successful_guest_sends: 0,
             host_input_suppression: "notImplemented".to_owned(),
             transport: KeyboardRoutingTransport::DiagnosticOnly,
+        })
+    }
+
+    pub fn keyboard_routing_status(&self) -> Option<KeyboardRoutingDiagnosticStatus> {
+        self.listener.lock().ok().and_then(|listener| {
+            listener.as_ref().and_then(|handle| match &handle.mode {
+                ListenerModeStatus::KeyboardRouting(status) => {
+                    let mut status = status.clone();
+                    status.successful_guest_sends = handle
+                        .successful_guest_sends
+                        .as_ref()
+                        .map(|count| count.load(Ordering::Relaxed))
+                        .unwrap_or_default();
+                    Some(status)
+                }
+                ListenerModeStatus::Identification(_) => None,
+            })
         })
     }
 
@@ -687,6 +771,34 @@ mod tests {
         aggregate_physical_devices, AsterRelatedPnpDevice, InputDevice, InputDiscovery,
         RawInputDevice,
     };
+
+    #[test]
+    fn duplicate_router_is_reused_only_for_same_physical_source_and_transport() {
+        let status = KeyboardRoutingDiagnosticStatus {
+            active: true,
+            target_physical_device_id: Some("barnen-keyboard".into()),
+            current_session_id: 1,
+            real_guest_injection_enabled: true,
+            successful_guest_sends: 0,
+            host_input_suppression: "notImplemented".into(),
+            transport: KeyboardRoutingTransport::VirtualBoxScancodePrototype,
+        };
+        assert!(same_keyboard_router(
+            &status,
+            "BARNEN-KEYBOARD",
+            KeyboardRoutingTransport::VirtualBoxScancodePrototype,
+        ));
+        assert!(!same_keyboard_router(
+            &status,
+            "dennis-keyboard",
+            KeyboardRoutingTransport::VirtualBoxScancodePrototype,
+        ));
+        assert!(!same_keyboard_router(
+            &status,
+            "barnen-keyboard",
+            KeyboardRoutingTransport::DiagnosticOnly,
+        ));
+    }
 
     #[test]
     fn raw_input_from_each_child_maps_to_the_same_physical_device() {

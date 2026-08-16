@@ -114,6 +114,19 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const barnen = config?.configuration.seats[1];
+    const running = seatRuntime?.status === "running" || seatRuntime?.status === "partiallyRunning" || seatRuntime?.status === "starting";
+    if (!barnen || !running) return;
+    let disposed = false;
+    const timer = window.setInterval(() => {
+      void invoke<SeatRuntimeSnapshot>("get_seat_runtime_status", { seatId: barnen.id })
+        .then((snapshot) => { if (!disposed) setSeatRuntime(snapshot); })
+        .catch((reason) => { if (!disposed) setError(String(reason)); });
+    }, 2000);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [config, seatRuntime?.status]);
+
+  useEffect(() => {
     const unlisten = listen<KeyboardRoutingDiagnosticEvent>("keyboard-routing-diagnostic", (event) => {
       setKeyboardDiagnosticEvents((current) => [...current.slice(-11), event.payload]);
       if (event.payload.action === "backendError") {
@@ -325,7 +338,7 @@ function App() {
     seatId: string,
   ) => {
     if (command === "start_virtual_box_seat" && !window.confirm(
-      "Start Barnen? The configured mouse will be captured by the VM. Keyboard USB passthrough remains disabled; native keyboard routing is only a diagnostic prototype.",
+      "Start Barnen? The configured mouse will be captured by the VM. Keyboard USB passthrough remains disabled; the assigned Barnen keyboard will be routed natively to the guest and will still also reach the host until suppression is implemented.",
     )) return;
     if (command === "allow_virtual_box_host_input_temporarily" && !window.confirm(
       "Temporarily allow Dennis's host keyboard and mouse to interact with the VirtualBox window? Barnen's USB devices remain attached to the guest.",
@@ -338,7 +351,9 @@ function App() {
       if (!result.success) {
         setError(`${result.errors.join("; ")}${result.rollbackAttempted ? " Rollback was attempted." : ""}`);
       }
-      setBackend(await invoke<BackendProbeSnapshot>("get_backend_probe"));
+      if (command !== "start_virtual_box_seat") {
+        setBackend(await invoke<BackendProbeSnapshot>("get_backend_probe"));
+      }
     } catch (reason) {
       setError(String(reason));
       setSeatRuntime(await invoke<SeatRuntimeSnapshot>("get_seat_runtime_status", { seatId }).catch(() => null));
@@ -715,7 +730,9 @@ function VirtualBoxSeatRuntime({
   onToggleKeyboardDiagnostic: () => void;
   onStartKeyboardInjection: () => void;
 }) {
-  const running = runtime?.status === "running" || runtime?.status === "partiallyRunning";
+  const [mouseInstructionAcknowledged, setMouseInstructionAcknowledged] = useState(false);
+  useEffect(() => setMouseInstructionAcknowledged(false), [runtime?.vmId]);
+  const running = runtime?.status === "running" || runtime?.status === "partiallyRunning" || runtime?.status === "starting";
   const selectedProfile = proposal?.profiles.find((profile) => profile.windowsVersion === form.windowsVersion);
   const fullHostname = form.installation.computerName.trim() && form.installation.domainName.trim()
     ? `${form.installation.computerName.trim().toLowerCase()}.${form.installation.domainName.trim().toLowerCase()}`
@@ -738,6 +755,7 @@ function VirtualBoxSeatRuntime({
           {machines.warnings.map((warning) => <small className="runtime-warning" key={warning}>{warning}</small>)}
           <div className="runtime-components">
             <RuntimeComponent label="VM" value={runtime?.vmState ?? "Not selected"} healthy={runtime?.vmState === "running"} />
+            <RuntimeComponent label="Display" value={runtime ? presentationStatusLabel(runtime) : seat.devices.display ? "Configured" : "Not configured"} healthy={runtime?.displayPresentation.state === "presented"} />
             <RuntimeComponent label="Keyboard" value={runtime ? routingStatusLabel(runtime.keyboard) : seat.devices.keyboard ? "Configured" : "Not configured"} healthy={runtime?.keyboard.routingStatus === "active"} />
             <RuntimeComponent label="Mouse" value={runtime ? routingStatusLabel(runtime.mouse) : seat.devices.mouse ? "Configured" : "Not configured"} healthy={runtime?.mouse.routingStatus === "active"} />
           </div>
@@ -746,6 +764,7 @@ function VirtualBoxSeatRuntime({
               <strong>Managed-seat input isolation</strong>
               <div className="security-summary">
                 <span>Keyboard routing: {routingStrategyLabel(runtime.keyboard.routingStrategy)} / {routingStatusLabel(runtime.keyboard)}</span>
+                <span>Keyboard guest scan-code sends: {runtime.keyboard.successfulGuestSends ?? "Not yet observed"}</span>
                 <span>Keyboard USB safety: {safetyLabel(runtime.keyboard.usbPassthroughSafety)}</span>
                 <span>Mouse routing: {routingStrategyLabel(runtime.mouse.routingStrategy)} / {routingStatusLabel(runtime.mouse)}</span>
                 <span>Mouse USB safety: {safetyLabel(runtime.mouse.usbPassthroughSafety)}</span>
@@ -754,8 +773,13 @@ function VirtualBoxSeatRuntime({
                 <span>Host mouse capture: {runtime.inputIsolation.mouseCaptureDisabled ? "Disabled" : runtime.inputIsolation.mouseCapturePolicy ?? "Unknown"}</span>
                 <span>Mouse Integration: {runtime.inputIsolation.mouseIntegration.observed === "unknown" ? `Unknown (${runtime.inputIsolation.mouseIntegration.control === "manualRequired" ? "manual action required" : "not verified"})` : runtime.inputIsolation.mouseIntegration.observed}</span>
                 <span>Mouse isolation: {runtime.inputIsolation.mouseIsolation}</span>
+                <span>Display assigned: {runtime.displayPresentation.displayName ?? runtime.displayPresentation.assignedDisplayId ?? "Not assigned"}</span>
+                <span>Presentation: {runtime.displayPresentation.state}</span>
+                <span>Presentation mode: {runtime.displayPresentation.mode === "borderless" ? "Borderless" : "Conventional VirtualBox window"}</span>
+                <span>Bounds: {runtime.displayPresentation.bounds ? `${runtime.displayPresentation.bounds.x}, ${runtime.displayPresentation.bounds.y}, ${runtime.displayPresentation.bounds.width} x ${runtime.displayPresentation.bounds.height}` : "Unavailable"}</span>
                 <span>Focus protection: {runtime.inputIsolation.focusProtectionActive ? "Active" : "Inactive"}</span>
                 <span>Host GUI keyboard isolation: Best effort</span>
+                <span>Overall isolation: Partially isolated</span>
               </div>
               <div className="usb-diagnostics">
                 <UsbRuntimeDiagnostic label="Keyboard" component={runtime.keyboard} />
@@ -764,7 +788,34 @@ function VirtualBoxSeatRuntime({
               {runtime.inputIsolation.mouseCapturePolicyError && <small className="runtime-warning">{runtime.inputIsolation.mouseCapturePolicyError}</small>}
               {runtime.inputIsolation.mouseIntegration.message && <small className="runtime-warning">{runtime.inputIsolation.mouseIntegration.message}</small>}
               {runtime.inputIsolation.focusProtectionError && <small className="runtime-warning">{runtime.inputIsolation.focusProtectionError}</small>}
+              {runtime.displayPresentation.lastError && <small className="runtime-warning">{runtime.displayPresentation.lastError}</small>}
+              {(runtime.startupTrace.length > 0 || runtime.displayPresentation.trace.length > 0) && (
+                <details>
+                  <summary>Developer startup trace</summary>
+                  {[...runtime.startupTrace, ...runtime.displayPresentation.trace.map((entry) => ({
+                    ...entry,
+                    exitStatus: null,
+                  }))]
+                    .sort((left, right) => left.timestampMs - right.timestampMs)
+                    .map((entry, index) => (
+                      <p key={`${entry.timestampMs}-${entry.stage}-${index}`}>
+                        +{entry.elapsedMs} ms / {entry.stage}{entry.durationMs !== null ? ` (${entry.durationMs} ms)` : ""}{entry.detail ? ` / ${entry.detail}` : ""}{entry.error ? ` / ${entry.error}` : ""}
+                      </p>
+                    ))}
+                  {runtime.displayPresentation.windowCandidates.map((candidate) => (
+                    <p key={`${candidate.processId}-${candidate.windowHandle}`}>
+                      HWND {candidate.windowHandle} / PID {candidate.processId} / {candidate.className || "unknown class"} / {candidate.visible ? "visible" : "hidden"} / owner {candidate.ownerWindowHandle ?? "none"} / {candidate.title || "untitled"}
+                    </p>
+                  ))}
+                </details>
+              )}
               {runtime.keyboard.safetyReason && <details><summary>Keyboard backend safety details</summary><p>{runtime.keyboard.safetyReason}</p></details>}
+            </div>
+          )}
+          {running && runtime?.displayPresentation.state === "presented" && runtime.inputIsolation.mouseIntegration.control === "manualRequired" && !mouseInstructionAcknowledged && (
+            <div className="runtime-message" role="status">
+              <span>Barnen mouse is connected. Disable VirtualBox Mouse Integration once to show the dedicated guest pointer. MultiSeat Lite cannot verify this setting through a documented external API.</span>
+              <button className="secondary-button" onClick={() => setMouseInstructionAcknowledged(true)}>Acknowledge for this session</button>
             </div>
           )}
           {runtime?.keyboard.routingStrategy === "nativeKeyboardRouting" && (
@@ -1009,6 +1060,18 @@ function routingStatusLabel(component: SeatRuntimeSnapshot["keyboard"]) {
     error: component.routingStrategy === "virtualBoxUsbPassthrough" ? usbHealthLabel(component.usb.health) : "Error",
     disabled: "Disabled",
   })[component.routingStatus];
+}
+
+function presentationStatusLabel(runtime: SeatRuntimeSnapshot) {
+  switch (runtime.displayPresentation.state) {
+    case "presented": return "Presented · Borderless";
+    case "waitingForVmWindow": return "Waiting for VM window";
+    case "resolvingDisplay": return "Resolving assigned display";
+    case "presenting": return "Applying presentation";
+    case "presentationUnavailable": return "Presentation unavailable";
+    case "error": return "Presentation error";
+    default: return "Not presented";
+  }
 }
 
 function safetyLabel(safety: SeatRuntimeSnapshot["keyboard"]["usbPassthroughSafety"]) {

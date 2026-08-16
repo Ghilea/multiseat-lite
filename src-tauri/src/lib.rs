@@ -266,56 +266,212 @@ fn select_virtual_box_vm(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn get_seat_runtime_status(
-    store: tauri::State<'_, seats::ConfigStore>,
-    runtime: tauri::State<'_, virtualization::VirtualBoxRuntimeService>,
+async fn get_seat_runtime_status(
+    app: tauri::AppHandle,
     seat_id: seats::SeatId,
 ) -> Result<virtualization::SeatRuntimeSnapshot, String> {
-    let hardware = enumerate_hardware()?;
-    runtime.status(&seat_id, &store.get()?, &hardware.input_devices)
+    tauri::async_runtime::spawn_blocking(move || {
+        let hardware = enumerate_hardware()?;
+        let store = app.state::<seats::ConfigStore>();
+        let configuration = store.get()?;
+        let mut snapshot = app
+            .state::<virtualization::VirtualBoxRuntimeService>()
+            .status(&seat_id, &configuration, &hardware.input_devices)?;
+        if configuration.input_routing(&seat_id).keyboard
+            == seats::InputRoutingStrategy::NativeKeyboardRouting
+        {
+            let live = app
+                .state::<input_identification::InputIdentificationService>()
+                .keyboard_routing_status();
+            snapshot.keyboard.successful_guest_sends =
+                live.as_ref().map(|status| status.successful_guest_sends);
+            snapshot.keyboard.routing_status = match live {
+                Some(status)
+                    if status.active
+                        && status.real_guest_injection_enabled
+                        && status.successful_guest_sends > 0 =>
+                {
+                    seats::InputRoutingRuntimeStatus::Active
+                }
+                Some(status) if status.active && status.real_guest_injection_enabled => {
+                    seats::InputRoutingRuntimeStatus::PrototypeActive
+                }
+                Some(_) => seats::InputRoutingRuntimeStatus::PrototypeActive,
+                None if snapshot.keyboard.routing_status
+                    == seats::InputRoutingRuntimeStatus::Active =>
+                {
+                    seats::InputRoutingRuntimeStatus::Error
+                }
+                None => snapshot.keyboard.routing_status,
+            };
+        }
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|error| format!("seat runtime status worker failed: {error}"))?
 }
 
 #[tauri::command(rename_all = "camelCase")]
 fn start_virtual_box_seat(
+    app: tauri::AppHandle,
     window: tauri::Window,
-    store: tauri::State<'_, seats::ConfigStore>,
-    runtime: tauri::State<'_, virtualization::VirtualBoxRuntimeService>,
     seat_id: seats::SeatId,
 ) -> Result<virtualization::SeatOperationResult, String> {
+    let configuration = app.state::<seats::ConfigStore>().get()?;
+    let anchor = focus_anchor(&window);
+    let runtime = app.state::<virtualization::VirtualBoxRuntimeService>();
+    let (cancellation, accepted) = runtime.begin_asynchronous_start(&seat_id, &configuration)?;
+    let worker_app = app.clone();
+    let worker_seat = seat_id.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name(format!("multiseat-start-{}", seat_id.0))
+        .spawn(move || {
+            let runtime = worker_app.state::<virtualization::VirtualBoxRuntimeService>();
+            let result = run_virtual_box_seat_start(
+                &worker_app,
+                &runtime,
+                &worker_seat,
+                anchor,
+                &cancellation,
+            );
+            if let Err(error) = result {
+                let _ =
+                    runtime.record_startup_stage(&worker_seat, "StartFailed", None, Some(&error));
+                let _ = runtime.record_error(&worker_seat, &error);
+            }
+            runtime.finish_asynchronous_start(&worker_seat);
+        })
+    {
+        runtime.finish_asynchronous_start(&seat_id);
+        runtime.record_error(
+            &seat_id,
+            &format!("could not spawn seat startup worker: {error}"),
+        )?;
+        return Err(format!("could not spawn seat startup worker: {error}"));
+    }
+    Ok(virtualization::SeatOperationResult {
+        success: true,
+        runtime: accepted,
+        errors: Vec::new(),
+        rollback_attempted: false,
+    })
+}
+
+fn run_virtual_box_seat_start(
+    app: &tauri::AppHandle,
+    runtime: &virtualization::VirtualBoxRuntimeService,
+    seat_id: &seats::SeatId,
+    focus_anchor: Option<isize>,
+    cancellation: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    let store = app.state::<seats::ConfigStore>();
     let hardware = enumerate_hardware()?;
     store.reconcile_hardware(&hardware)?;
     let mut configuration = store.get()?;
-    if runtime.ensure_managed_mouse_capture_disabled(&seat_id, &configuration)? {
+    if runtime.ensure_managed_mouse_capture_disabled(seat_id, &configuration)? {
         store.set_mouse_capture_policy_owned(seat_id.clone(), true)?;
         configuration = store.get()?;
     }
-    match runtime.start(
-        &seat_id,
+    runtime.start_with_cancellation(
+        seat_id,
         &configuration,
         &hardware.input_devices,
-        focus_anchor(&window),
-    ) {
-        Ok(snapshot) => Ok(virtualization::SeatOperationResult {
-            success: true,
-            runtime: snapshot,
-            errors: Vec::new(),
-            rollback_attempted: false,
-        }),
-        Err(error) => {
-            runtime.record_error(&seat_id, &error)?;
-            let snapshot = runtime.status(&seat_id, &configuration, &hardware.input_devices)?;
-            let rollback_attempted = snapshot
-                .logs
-                .iter()
-                .any(|log| log.action == "rollback-detach");
-            Ok(virtualization::SeatOperationResult {
-                success: false,
-                runtime: snapshot,
-                errors: vec![error],
-                rollback_attempted,
-            })
+        focus_anchor,
+        cancellation,
+    )?;
+
+    if configuration.input_routing(seat_id).keyboard
+        == seats::InputRoutingStrategy::NativeKeyboardRouting
+    {
+        runtime.record_startup_stage(seat_id, "KeyboardRouterStarting", None, None)?;
+        let keyboard_started = std::time::Instant::now();
+        let result = start_production_keyboard_router(app, seat_id, &configuration, &hardware);
+        match result {
+            Ok(status) if status.active && status.real_guest_injection_enabled => {
+                runtime.set_keyboard_routing_runtime(
+                    seat_id,
+                    if status.successful_guest_sends > 0 {
+                        seats::InputRoutingRuntimeStatus::Active
+                    } else {
+                        seats::InputRoutingRuntimeStatus::PrototypeActive
+                    },
+                    "configured physical keyboard source and VirtualBox guest sink are active; guest routing becomes Active after the first successful scan-code send",
+                )?;
+                runtime.record_startup_duration(
+                    seat_id,
+                    "KeyboardRouterActive",
+                    keyboard_started,
+                    Some("production source and sink initialization completed; scan-code health is observed independently"),
+                    None,
+                )?;
+            }
+            Ok(_) => {
+                runtime.set_keyboard_routing_runtime(
+                    seat_id,
+                    seats::InputRoutingRuntimeStatus::Error,
+                    "keyboard listener did not report an active guest injection transport",
+                )?;
+                runtime.record_startup_duration(
+                    seat_id,
+                    "KeyboardRouterFailed",
+                    keyboard_started,
+                    None,
+                    Some("listener did not report active guest injection"),
+                )?;
+            }
+            Err(error) => {
+                runtime.set_keyboard_routing_runtime(
+                    seat_id,
+                    seats::InputRoutingRuntimeStatus::Error,
+                    &error,
+                )?;
+                runtime.record_startup_duration(
+                    seat_id,
+                    "KeyboardRouterFailed",
+                    keyboard_started,
+                    None,
+                    Some(&error),
+                )?;
+            }
         }
     }
+    Ok(())
+}
+
+fn start_production_keyboard_router(
+    app: &tauri::AppHandle,
+    seat_id: &seats::SeatId,
+    configuration: &seats::ApplicationConfig,
+    hardware: &HardwareSnapshot,
+) -> Result<keyboard_routing::KeyboardRoutingDiagnosticStatus, String> {
+    let backend = configuration
+        .backends
+        .virtual_box
+        .seats
+        .get(&seat_id.0)
+        .ok_or_else(|| "seat has no VirtualBox VM selected".to_owned())?;
+    if !backend.managed_by_multiseat {
+        return Err("native keyboard routing is limited to a managed VM".to_owned());
+    }
+    let keyboard = configuration
+        .seats
+        .iter()
+        .find(|seat| &seat.id == seat_id)
+        .and_then(|seat| seat.devices.keyboard.as_ref())
+        .ok_or_else(|| "seat has no configured keyboard".to_owned())?;
+    if !hardware
+        .input_devices
+        .iter()
+        .any(|device| device.capabilities.keyboard && device.id.eq_ignore_ascii_case(&keyboard.0))
+    {
+        return Err(format!(
+            "configured Barnen keyboard '{}' is not present",
+            keyboard.0
+        ));
+    }
+    let sink = virtualization::VirtualBoxGuestKeyboardSink::discover(backend.vm_id.clone())?;
+    app.state::<input_identification::InputIdentificationService>()
+        .start_keyboard_injection(app.clone(), keyboard.0.clone(), Box::new(sink))
 }
 
 #[tauri::command(rename_all = "camelCase")]

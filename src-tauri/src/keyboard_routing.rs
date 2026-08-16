@@ -180,6 +180,7 @@ pub struct KeyboardRoutingDiagnosticStatus {
     pub target_physical_device_id: Option<String>,
     pub current_session_id: u32,
     pub real_guest_injection_enabled: bool,
+    pub successful_guest_sends: u64,
     pub host_input_suppression: String,
     pub transport: KeyboardRoutingTransport,
 }

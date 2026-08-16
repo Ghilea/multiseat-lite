@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, mem::size_of};
 
 use windows::{
-    core::PCWSTR,
+    core::{BOOL, PCWSTR},
     Win32::{
         Devices::{
             DeviceAndDriverInstallation::{
@@ -12,21 +12,23 @@ use windows::{
             },
             Display::{
                 DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
+                DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
                 DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_DEVICE_INFO_HEADER,
-                DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_TARGET_DEVICE_NAME,
-                QDC_ALL_PATHS, QDC_VIRTUAL_MODE_AWARE,
+                DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+                DISPLAYCONFIG_TARGET_DEVICE_NAME, QDC_ALL_PATHS, QDC_VIRTUAL_MODE_AWARE,
             },
         },
-        Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LUID},
+        Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, LPARAM, LUID, RECT},
         Graphics::Gdi::{
-            EnumDisplayDevicesW, DISPLAYCONFIG_PATH_ACTIVE, DISPLAY_DEVICEW, DISPLAY_DEVICE_ACTIVE,
-            DISPLAY_DEVICE_ATTACHED_TO_DESKTOP, DISPLAY_DEVICE_MIRRORING_DRIVER,
-            DISPLAY_DEVICE_PRIMARY_DEVICE, DISPLAY_DEVICE_REMOTE,
+            EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAYCONFIG_PATH_ACTIVE,
+            DISPLAY_DEVICEW, DISPLAY_DEVICE_ACTIVE, DISPLAY_DEVICE_ATTACHED_TO_DESKTOP,
+            DISPLAY_DEVICE_MIRRORING_DRIVER, DISPLAY_DEVICE_PRIMARY_DEVICE, DISPLAY_DEVICE_REMOTE,
+            HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
         },
     },
 };
 
-use super::{DisplayConfigTarget, DisplayDevice, DisplayDiscovery, PnpMonitor};
+use super::{DisplayBounds, DisplayConfigTarget, DisplayDevice, DisplayDiscovery, PnpMonitor};
 
 const ERROR_NO_MORE_ITEMS_HRESULT: u32 = 0x8007_0103;
 
@@ -47,8 +49,10 @@ pub fn enumerate() -> Result<DisplayDiscovery, String> {
     })
 }
 
-fn enumerate_session_visible_displays() -> Result<Vec<DisplayDevice>, String> {
+pub(super) fn enumerate_session_visible_displays() -> Result<Vec<DisplayDevice>, String> {
     let mut displays = Vec::new();
+    let desktop_bounds = enumerate_desktop_bounds()?;
+    let pnp_ids_by_source = enumerate_active_pnp_ids_by_source()?;
     let mut adapter_index = 0;
 
     loop {
@@ -111,18 +115,68 @@ fn enumerate_session_visible_displays() -> Result<Vec<DisplayDevice>, String> {
 
             displays.push(DisplayDevice {
                 id: stable_id,
+                pnp_instance_id: pnp_ids_by_source.get(&adapter_device_name).cloned(),
                 device_name: monitor_name,
+                desktop_device_name: adapter_device_name.clone(),
                 friendly_name: non_empty(utf16_field(&monitor.DeviceString)),
                 device_path: non_empty(device_key),
                 adapter_name: adapter_name.clone(),
                 adapter_device_id: adapter_id.clone(),
                 primary,
+                bounds: desktop_bounds.get(&adapter_device_name).copied(),
             });
         }
     }
 
     displays.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(displays)
+}
+
+fn enumerate_desktop_bounds() -> Result<BTreeMap<String, DisplayBounds>, String> {
+    let mut result = BTreeMap::new();
+    // SAFETY: The callback only borrows `result` for this synchronous call.
+    let succeeded = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor_bounds),
+            LPARAM((&mut result as *mut BTreeMap<String, DisplayBounds>) as isize),
+        )
+    };
+    if !succeeded.as_bool() {
+        return Err("EnumDisplayMonitors failed while resolving desktop bounds".to_owned());
+    }
+    Ok(result)
+}
+
+unsafe extern "system" fn collect_monitor_bounds(
+    monitor: HMONITOR,
+    _device_context: HDC,
+    _monitor_rect: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    let result = unsafe { &mut *(data.0 as *mut BTreeMap<String, DisplayBounds>) };
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // MONITORINFOEXW is layout-compatible with MONITORINFO at offset zero.
+    if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+        let rect = info.monitorInfo.rcMonitor;
+        result.insert(
+            utf16_field(&info.szDevice),
+            DisplayBounds {
+                x: rect.left,
+                y: rect.top,
+                width: rect.right - rect.left,
+                height: rect.bottom - rect.top,
+            },
+        );
+    }
+    BOOL(1)
 }
 
 fn enumerate_pnp_monitors() -> Result<Vec<PnpMonitor>, String> {
@@ -173,47 +227,7 @@ fn enumerate_pnp_monitors() -> Result<Vec<PnpMonitor>, String> {
 }
 
 fn enumerate_display_config_targets() -> Result<Vec<DisplayConfigTarget>, String> {
-    let flags = QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE;
-    let mut paths = Vec::new();
-
-    for _ in 0..3 {
-        let mut path_count = 0;
-        let mut mode_count = 0;
-        // SAFETY: Both count pointers are valid output storage.
-        let size_result =
-            unsafe { GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count) };
-        if size_result != ERROR_SUCCESS {
-            return Err(format!(
-                "GetDisplayConfigBufferSizes failed with Windows error {}",
-                size_result.0
-            ));
-        }
-
-        paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
-        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
-        // SAFETY: Arrays are allocated to the sizes returned immediately above.
-        let query_result = unsafe {
-            QueryDisplayConfig(
-                flags,
-                &mut path_count,
-                paths.as_mut_ptr(),
-                &mut mode_count,
-                modes.as_mut_ptr(),
-                None,
-            )
-        };
-        if query_result == ERROR_INSUFFICIENT_BUFFER {
-            continue;
-        }
-        if query_result != ERROR_SUCCESS {
-            return Err(format!(
-                "QueryDisplayConfig failed with Windows error {}",
-                query_result.0
-            ));
-        }
-        paths.truncate(path_count as usize);
-        break;
-    }
+    let paths = query_display_config_paths()?;
 
     let mut targets = BTreeMap::<String, DisplayConfigTarget>::new();
     for path in paths {
@@ -249,6 +263,101 @@ fn enumerate_display_config_targets() -> Result<Vec<DisplayConfigTarget>, String
     }
 
     Ok(targets.into_values().collect())
+}
+
+fn query_display_config_paths() -> Result<Vec<DISPLAYCONFIG_PATH_INFO>, String> {
+    let flags = QDC_ALL_PATHS | QDC_VIRTUAL_MODE_AWARE;
+
+    for _ in 0..3 {
+        let mut path_count = 0;
+        let mut mode_count = 0;
+        // SAFETY: Both count pointers are valid output storage.
+        let size_result =
+            unsafe { GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count) };
+        if size_result != ERROR_SUCCESS {
+            return Err(format!(
+                "GetDisplayConfigBufferSizes failed with Windows error {}",
+                size_result.0
+            ));
+        }
+
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
+        // SAFETY: Arrays are allocated to the sizes returned immediately above.
+        let query_result = unsafe {
+            QueryDisplayConfig(
+                flags,
+                &mut path_count,
+                paths.as_mut_ptr(),
+                &mut mode_count,
+                modes.as_mut_ptr(),
+                None,
+            )
+        };
+        if query_result == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        if query_result != ERROR_SUCCESS {
+            return Err(format!(
+                "QueryDisplayConfig failed with Windows error {}",
+                query_result.0
+            ));
+        }
+        paths.truncate(path_count as usize);
+        return Ok(paths);
+    }
+    Err("QueryDisplayConfig topology changed repeatedly while enumerating displays".to_owned())
+}
+
+fn enumerate_active_pnp_ids_by_source() -> Result<BTreeMap<String, String>, String> {
+    let mut result = BTreeMap::new();
+    for path in query_display_config_paths()?
+        .into_iter()
+        .filter(|path| path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0)
+    {
+        let Some(source_name) =
+            display_config_source_name(path.sourceInfo.adapterId, path.sourceInfo.id)
+        else {
+            continue;
+        };
+        let Some((_, Some(target_path))) =
+            display_config_target_name(path.targetInfo.adapterId, path.targetInfo.id)
+        else {
+            continue;
+        };
+        if let Some(instance_id) = pnp_instance_id_from_monitor_device_path(&target_path) {
+            result.insert(source_name, instance_id);
+        }
+    }
+    Ok(result)
+}
+
+fn display_config_source_name(adapter: LUID, id: u32) -> Option<String> {
+    let mut name = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+        header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+            r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+            size: size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+            adapterId: adapter,
+            id,
+        },
+        ..Default::default()
+    };
+    // SAFETY: name begins with the required initialized DisplayConfig header.
+    (unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } == 0)
+        .then(|| utf16_field(&name.viewGdiDeviceName))
+        .filter(|value| !value.is_empty())
+}
+
+fn pnp_instance_id_from_monitor_device_path(path: &str) -> Option<String> {
+    let without_prefix = path
+        .strip_prefix(r"\\?\")
+        .or_else(|| path.strip_prefix(r"\??\"))?;
+    let interface = without_prefix.split("#{").next()?.trim_end_matches('#');
+    let instance_id = interface.replace('#', r"\");
+    instance_id
+        .to_ascii_uppercase()
+        .starts_with(r"DISPLAY\")
+        .then_some(instance_id)
 }
 
 fn display_config_target_name(adapter: LUID, id: u32) -> Option<(Option<String>, Option<String>)> {
@@ -340,4 +449,27 @@ fn utf16_field(value: &[u16]) -> String {
 
 fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pnp_instance_id_from_monitor_device_path;
+
+    #[test]
+    fn displayconfig_interface_path_maps_to_exact_pnp_monitor_instance() {
+        let path =
+            r"\\?\DISPLAY#BNQ7840#5&321f5076&0&UID41217#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        assert_eq!(
+            pnp_instance_id_from_monitor_device_path(path).as_deref(),
+            Some(r"DISPLAY\BNQ7840\5&321f5076&0&UID41217")
+        );
+    }
+
+    #[test]
+    fn non_monitor_interface_path_is_not_accepted_as_display_identity() {
+        assert!(pnp_instance_id_from_monitor_device_path(
+            r"\\?\HID#VID_1234&PID_5678#INSTANCE#{guid}"
+        )
+        .is_none());
+    }
 }

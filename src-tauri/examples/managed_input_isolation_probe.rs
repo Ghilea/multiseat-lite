@@ -60,6 +60,29 @@ fn main() -> Result<(), String> {
         "Mouse isolation: {:?}",
         snapshot.input_isolation.mouse_isolation
     );
+    println!(
+        "Presentation state: {:?}",
+        snapshot.display_presentation.state
+    );
+    println!(
+        "Presentation mode: {:?}",
+        snapshot.display_presentation.mode
+    );
+    println!(
+        "Assigned display: {}",
+        snapshot
+            .display_presentation
+            .assigned_display_id
+            .as_deref()
+            .unwrap_or("none")
+    );
+    println!(
+        "Presentation bounds: {:?}",
+        snapshot.display_presentation.bounds
+    );
+    if let Some(error) = snapshot.display_presentation.last_error {
+        println!("Presentation note: {error}");
+    }
     if let Some(message) = snapshot.input_isolation.mouse_integration.message {
         println!("Mouse Integration note: {message}");
     }

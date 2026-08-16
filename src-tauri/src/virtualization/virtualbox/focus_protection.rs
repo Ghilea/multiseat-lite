@@ -133,8 +133,7 @@ mod windows_backend {
         {
             return true;
         }
-        target.session_pid.is_none()
-            && !target.vm_name.trim().is_empty()
+        !target.vm_name.trim().is_empty()
             && window
                 .title
                 .to_ascii_lowercase()
@@ -435,6 +434,15 @@ mod windows_backend {
                 true
             ));
             assert!(!should_restore_focus(
+                &target(),
+                Some(&WindowDescriptor {
+                    process_id: 43,
+                    title: "Unrelated VM [Running] - Oracle VirtualBox".into(),
+                    ..managed_window()
+                }),
+                true
+            ));
+            assert!(should_restore_focus(
                 &target(),
                 Some(&WindowDescriptor {
                     process_id: 43,
